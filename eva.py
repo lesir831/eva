@@ -372,7 +372,6 @@ def run_cli(command: str, timeout: int = 300):
             output += f"\nSTDERR:\n{result.stderr}"
         return output.strip() or "(no output)"
     except Exception as e:
-
         return f"执行失败：{str(e)}"
 
 def _trim_tool_content(msg):
@@ -759,6 +758,12 @@ def clear_session():
         print(f"> 会话不存在：{session_file}")
 
 # ====================== Agent Loop ======================
+def is_valid_argument(data: str) -> bool:
+    try:
+        return isinstance(json.loads(data), dict)
+    except Exception:
+        return False
+
 def _detect_malformed_tool_call(content: str):
     content = content.lower() 
     return bool(re.search(r'run_cli.*arguments.*{.*command.*}', content, re.DOTALL | re.IGNORECASE)
@@ -782,13 +787,13 @@ def agent_single_loop():
                 messages.append({"role": "user", "content": "警告：你的一条消息因为在think中输出了大量重复内容，已被擦除。请继续完成任务，严禁在think中陷入循环！"})
                 continue
             LAST_USAGE = usage
-            msg_idx = len(messages)
             messages.append(msg)
 
             # 流式输出已经实时打印了内容，这里只需换行
             sys.stdout.write("\n\n")
             sys.stdout.flush()
 
+            # 无工具调用，准备退出，做些非法调用检查
             if not msg.get('tool_calls'):
                 content = msg.get('content', '')
                 if not content:
@@ -799,6 +804,14 @@ def agent_single_loop():
                     messages.append({"role": "user", "content": "警告：工具调用格式不正确，请重新以正确的格式调用 run_cli 工具。"})
                     continue
                 break  # 有文字回复，正常结束
+
+            # 检测工具格式正确性
+            if any(not is_valid_argument(tc['function']['arguments']) for tc in msg['tool_calls']):
+                messages[-1] = {
+                        "role": "user",
+                        "content": "警告：你上一次的工具调用参数不是合法的 JSON 对象，该次工具调用已被删除。请重新以正确的 JSON 格式调用工具。"
+                    }
+                continue
 
             for tc in msg['tool_calls']:
                 func = tc['function']
@@ -816,15 +829,6 @@ def agent_single_loop():
                     print("\n\n工具调用已中断，退出 agent_single_loop，回到用户 turn")
                     result = "用户中止该工具运行"
                     break_loop = True
-                except json.JSONDecodeError as e:
-                    del messages[msg_idx:]
-                    messages.append({
-                        "role": "user",
-                        "content": f"警告：你上一次的工具调用参数不是合法的 JSON 字符串，"
-                                   f"具体错误：{str(e)}。该次工具调用已被删除，"
-                                   f"请重新以正确的 JSON 格式调用工具。"
-                    })
-                    break
                 except Exception as e:
                     result = f"工具执行异常：{str(e)}"
 
