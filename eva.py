@@ -1,4 +1,4 @@
-﻿import os, sys
+import os, sys
 import re
 import json
 import subprocess
@@ -489,6 +489,27 @@ def llm_chat(messages, tools=None, temperature=0.6, thinking=True):
 class ThinkRepeatError(Exception):
     pass
 
+class LLMResponseError(Exception):
+    """接口返回无效数据或没有可供用户使用的回复。"""
+
+def _iter_sse_payloads(response):
+    """按 SSE 事件读取 data 字段，兼容冒号后有无空格及多行数据。"""
+    data_lines = []
+    for raw_line in response:
+        line = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
+        if not line:
+            if data_lines:
+                yield '\n'.join(data_lines)
+                data_lines = []
+            continue
+        field, separator, value = line.partition(':')
+        if field == 'data':
+            if value.startswith(' '):
+                value = value[1:]
+            data_lines.append(value)
+    if data_lines:
+        yield '\n'.join(data_lines)
+
 # 判断后缀是否是超过阈值的连续重复子串，适用于检测think内容的重复输出，避免模型陷入循环
 class RepeatSuffixChecker:
     def __init__(self, min_unit_len: int, base: int = 91138233, mod: int = 10**9 + 7):
@@ -536,6 +557,7 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
     usage = None
     role = "assistant"
     is_thinking = False
+    finish_reason = None
 
     # 正文模式：rich可用且为终端时，缓冲到结束一次性Markdown渲染（表格对齐，不污染滚动缓冲）；
     # 否则逐块流式输出
@@ -545,20 +567,18 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
     detector = RepeatSuffixChecker(min_unit_len=400)
 
     try:
-        for raw_line in resp:
-            line = raw_line.decode('utf-8', errors='replace').rstrip('\r\n')
-            if not line:
-                continue
-            if not line.startswith('data: '):
-                continue
-            payload = line[6:]
+        for payload in _iter_sse_payloads(resp):
             if payload.strip() == '[DONE]':
                 break
 
             try:
                 chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as e:
+                raise LLMResponseError("流式响应的 data 不是合法 JSON，请检查接口协议。") from e
+            if not isinstance(chunk, dict):
+                raise LLMResponseError("流式响应的 data 必须是 JSON 对象。")
+            if chunk.get('error'):
+                raise LLMResponseError(f"流式接口返回错误：{chunk['error']}")
 
             # 提取 usage（最后一个 chunk 带 usage）
             if 'usage' in chunk and chunk['usage']:
@@ -568,6 +588,7 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
             if not choices:
                 continue
 
+            finish_reason = choices[0].get('finish_reason') or finish_reason
             delta = choices[0].get('delta', {})
             if not delta:
                 continue
@@ -636,6 +657,12 @@ def llm_chat_stream(messages, tools=None, temperature=0.6, thinking=True):
         message['reasoning_content'] = ""  # deepseek 要求即使没有 thinking 也必须传空字符串
     if tool_calls_map:
         message['tool_calls'] = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())]
+
+    if not full_content.strip() and not tool_calls_map:
+        raise LLMResponseError(
+            f"模型未返回正文或工具调用（finish_reason={finish_reason!r}）。"
+            "请检查接口响应格式或模型配置；已停止本轮，未写入空回复。"
+        )
 
     if usage is None:
         usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
@@ -781,6 +808,8 @@ def agent_single_loop():
                 messages.append({"role": "user", "content": "警告：你的一条消息因为在think中输出了大量重复内容，已被擦除。请继续完成任务，严禁在think中陷入循环！"})
                 continue
             LAST_USAGE = usage
+            if not (msg.get('content') or '').strip() and not msg.get('tool_calls'):
+                raise LLMResponseError("模型回复为空，已停止本轮，未写入空回复。")
             msg_idx = len(messages)
             messages.append(msg)
 
@@ -790,10 +819,6 @@ def agent_single_loop():
 
             if not msg.get('tool_calls'):
                 content = msg.get('content', '')
-                if not content:
-                    messages.append({"role": "user", "content": "警告：你刚才的回复为空，没有输出任何内容也没有调用工具，请重新回答。"})
-                    continue
-
                 if _detect_malformed_tool_call(content):
                     messages.append({"role": "user", "content": "警告：工具调用格式不正确，请重新以正确的格式调用 run_cli 工具。"})
                     continue
@@ -859,12 +884,12 @@ def agent_single_loop():
                 continue
         except KeyboardInterrupt:
             print("\n\nagent_single_loop 已中断，回到用户 turn")
-            break_loop = True
-            break
+            return False
 
         except Exception as e:
             print(f"LLM 调用异常：{e}")
-            break
+            return False
+    return not break_loop
 
 # ====================== 主循环 ======================
 def human_loop(user_ask=None, save_after=False, goal=False):
@@ -882,7 +907,8 @@ def human_loop(user_ask=None, save_after=False, goal=False):
             display_usage(LAST_USAGE, TOKEN_CAP)
             if user_ask:
                 while True:
-                    agent_single_loop()
+                    if agent_single_loop() is False:
+                        break
                     msg = messages[-1]
                     if not goal or (msg.get('role') == 'assistant' and GOAL_MARKER in msg.get('content', '')):
                         break
